@@ -1,0 +1,167 @@
+# Core
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Modeling
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import (
+    classification_report, confusion_matrix, roc_auc_score, RocCurveDisplay
+)
+from sklearn.inspection import permutation_importance
+# In Colab: run this and pick your file (e.g., earthquake_data_tsunami.csv)
+from google.colab import files
+uploaded = files.upload()
+
+csv_path = next(iter(uploaded))  # first uploaded file
+df = pd.read_csv(csv_path)
+
+df.head(), df.shape, df.columns
+
+print(df.isna().sum())  # should be all zeros per dataset description
+
+target = "tsunami"
+assert target in df.columns, "Expected 'tsunami' target column"
+
+print("Class balance:")
+print(df[target].value_counts())
+print((df[target].value_counts(normalize=True) * 100).round(2).astype(str) + "%")
+
+display(df.describe(include='all'))
+
+# Histograms for a few key variables
+for col in ["magnitude", "depth", "sig"]:
+    ax = df[col].hist(bins=20)
+    ax.set_title(f"Distribution of {col}")
+    ax.set_xlabel(col); ax.set_ylabel("Count")
+    plt.show()
+
+# Annual count of significant earthquakes
+ax = df["Year"].value_counts().sort_index().plot(kind="bar")
+ax.set_title("Number of significant earthquakes per year")
+ax.set_xlabel("Year"); ax.set_ylabel("Count")
+plt.tight_layout(); plt.show()
+
+# Tsunami rate by year (useful to spot temporal drift/leakage)
+year_rate = df.groupby("Year")[target].mean()
+ax = year_rate.plot(marker="o")
+ax.set_title("Share of tsunami-potential events by year")
+ax.set_xlabel("Year"); ax.set_ylabel("Rate")
+plt.show()
+
+# Quick lon/lat scatter
+plt.scatter(df["longitude"], df["latitude"], s=10, alpha=0.6)
+plt.title("Epicenter locations (lon/lat)")
+plt.xlabel("Longitude"); plt.ylabel("Latitude")
+plt.show()
+
+feature_cols = [c for c in df.columns if c != target]
+X = df[feature_cols]
+y = df[target]
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+pipe = Pipeline([
+    ("scaler", StandardScaler()),
+    ("mlp", MLPClassifier(hidden_layer_sizes=(32,16),
+                          activation="relu", solver="adam",
+                          max_iter=500, random_state=42))
+])
+
+pipe.fit(X_train, y_train)
+y_pred  = pipe.predict(X_test)
+y_proba = pipe.predict_proba(X_test)[:,1]
+
+print("=== Baseline with all features (incl. Year/Month) ===")
+print(classification_report(y_test, y_pred))
+print("Confusion matrix:\n", confusion_matrix(y_test, y_pred))
+print("ROC-AUC:", roc_auc_score(y_test, y_proba))
+
+RocCurveDisplay.from_predictions(y_test, y_proba)
+plt.title("ROC – MLP baseline (all features)")
+plt.show()
+
+
+perm = permutation_importance(
+    pipe, X_test, y_test, n_repeats=15, random_state=42, scoring="roc_auc"
+)
+imp = pd.DataFrame({
+    "feature": feature_cols,
+    "mean_auc_drop": perm.importances_mean,
+    "std": perm.importances_std
+}).sort_values("mean_auc_drop", ascending=False)
+display(imp.head(10))
+
+ax = imp.plot(x="feature", y="mean_auc_drop", kind="bar", yerr="std", legend=False)
+ax.set_title("Permutation importance (AUC decrease)")
+ax.set_ylabel("Mean AUC decrease"); plt.tight_layout(); plt.show()
+
+
+reduced_features = [c for c in feature_cols if c not in ["Year","Month"]]
+X2 = df[reduced_features]
+
+X2_train, X2_test, y_train, y_test = train_test_split(
+    X2, y, test_size=0.2, random_state=42, stratify=y
+)
+
+pipe2 = Pipeline([
+    ("scaler", StandardScaler()),
+    ("mlp", MLPClassifier(hidden_layer_sizes=(32,16),
+                          activation="relu", solver="adam",
+                          max_iter=500, random_state=42))
+])
+
+pipe2.fit(X2_train, y_train)
+y_pred2  = pipe2.predict(X2_test)
+y_proba2 = pipe2.predict_proba(X2_test)[:,1]
+
+print("=== Leakage-aware model (no Year/Month) ===")
+print(classification_report(y_test, y_pred2))
+print("Confusion matrix:\n", confusion_matrix(y_test, y_pred2))
+print("ROC-AUC:", roc_auc_score(y_test, y_proba2))
+
+RocCurveDisplay.from_predictions(y_test, y_proba2)
+plt.title("ROC – MLP (no Year/Month)")
+plt.show()
+
+# New permutation importance (sanity: geophysical drivers should rank high)
+perm2 = permutation_importance(
+    pipe2, X2_test, y_test, n_repeats=15, random_state=42, scoring="roc_auc"
+)
+imp2 = pd.DataFrame({
+    "feature": reduced_features,
+    "mean_auc_drop": perm2.importances_mean,
+    "std": perm2.importances_std
+}).sort_values("mean_auc_drop", ascending=False)
+display(imp2.head(10))
+
+
+import joblib, os
+os.makedirs("artifacts", exist_ok=True)
+joblib.dump(pipe2, "artifacts/tsunami_mlp_pipeline.pkl")
+print("Saved to artifacts/tsunami_mlp_pipeline.pkl")
+
+
+!pip -q install gradio
+
+import gradio as gr
+import joblib
+import numpy as np
+
+model = joblib.load("artifacts/tsunami_mlp_pipeline.pkl")
+inputs = [gr.Number(label=c) for c in reduced_features]
+
+def predict(*vals):
+    X_in = np.array([vals], dtype=float)
+    proba = float(model.predict_proba(X_in)[:,1])
+    label = "High" if proba >= 0.5 else "Low/Medium"
+    return {"Tsunami probability": round(proba,3), "Risk band (0.5 thr.)": label}
+
+demo = gr.Interface(fn=predict, inputs=inputs, outputs="json",
+                    title="Earthquake → Tsunami Potential (MLP)")
+demo.launch()
